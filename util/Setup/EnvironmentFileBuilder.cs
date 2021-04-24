@@ -22,6 +22,7 @@ namespace Bit.Setup
             {
                 ["ASPNETCORE_ENVIRONMENT"] = "Production",
                 ["globalSettings__selfHosted"] = "true",
+                ["globalSettings__baseServiceUri__domain"] = "localhost",
                 ["globalSettings__baseServiceUri__vault"] = "http://localhost",
                 ["globalSettings__baseServiceUri__api"] = "http://localhost/api",
                 ["globalSettings__baseServiceUri__identity"] = "http://localhost/identity",
@@ -88,6 +89,7 @@ namespace Bit.Setup
 
             _globalOverrideValues = new Dictionary<string, string>
             {
+                ["globalSettings__baseServiceUri__domain"] = _context.Config.Domain,
                 ["globalSettings__baseServiceUri__vault"] = _context.Config.Url,
                 ["globalSettings__baseServiceUri__api"] = $"{_context.Config.Url}/api",
                 ["globalSettings__baseServiceUri__identity"] = $"{_context.Config.Url}/identity",
