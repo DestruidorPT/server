@@ -21,13 +21,21 @@ using System.IO;
 using Newtonsoft.Json;
 using Microsoft.AspNetCore.DataProtection;
 using U2F.Core.Exceptions;
+using Fido2NetLib;
+using Fido2NetLib.Objects;
+using Bit.Core.Repositories.SqlServer;
+using System.Text.Json;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace Bit.Core.Services
 {
     public class UserService : UserManager<User>, IUserService, IDisposable
     {
         private const string PremiumPlanId = "premium-annually";
-        private const string StoragePlanId = "storage-gb-annually";
+        private const string StoragePlanId = "storage-gb-annually"; 
+        private const int MaxFido2Keys = 5;  // Num max FIDO2 Keys can be registered.
+        private const int MaxFido2Time = 30000;  // Temp max to regist or auth using FIDO2.
 
         private readonly IUserRepository _userRepository;
         private readonly ICipherRepository _cipherRepository;
@@ -50,6 +58,8 @@ namespace Bit.Core.Services
         private readonly ICurrentContext _currentContext;
         private readonly GlobalSettings _globalSettings;
         private readonly IOrganizationService _organizationService;
+        private readonly IFido2KeyRepository _fido2KeyRepository;
+        private readonly IFido2ChallengeRepository _fido2ChallengeRepository;
 
         public UserService(
             IUserRepository userRepository,
@@ -57,6 +67,7 @@ namespace Bit.Core.Services
             IOrganizationUserRepository organizationUserRepository,
             IOrganizationRepository organizationRepository,
             IU2fRepository u2fRepository,
+            IFido2KeyRepository fido2KeyRepository,
             IMailService mailService,
             IPushNotificationService pushService,
             IUserStore<User> store,
@@ -111,6 +122,9 @@ namespace Bit.Core.Services
             _currentContext = currentContext;
             _globalSettings = globalSettings;
             _organizationService = organizationService;
+
+            _fido2KeyRepository = fido2KeyRepository;
+            _fido2ChallengeRepository = new Fido2ChallengeRepository(_globalSettings);
         }
 
         public Guid? GetProperUserId(ClaimsPrincipal principal)
@@ -488,6 +502,350 @@ namespace Bit.Core.Services
             return true;
         }
 
+        /// <summary>
+        /// Get all FIDO2 Keys that belongs to the user id
+        /// </summary>
+        public async Task<List<Fido2Key>> GetAllFido2KeysAsync(User user)
+        {
+            return (List<Fido2Key>)await _fido2KeyRepository.GetManyByUserIdAsync(user.Id);
+        }
+
+        /// <summary>
+        /// Request the data necessarie to start the process of FIDO2 Key Registration .
+        /// </summary>
+        public async Task<CredentialCreateOptions> StartFido2RegistrationAsync(User user, string origin, AuthenticatorSelection authenticatorSelected)
+        {
+            //First delete the first 100 challenges that run out of time.
+            await _fido2ChallengeRepository.DeleteManyExpiredAsync();
+
+            //  Regist Fido2 User, for the user to confirm the account name when registering a new key.
+            var userFido2 = new Fido2User();
+            userFido2.Id = user.Id.ToByteArray();
+            userFido2.Name = user.Name;
+            userFido2.DisplayName = user.Name;
+
+            // Get all FIDO2 Keys that belongs to the user.
+            var fido2Keys = await GetAllFido2KeysAsync(user);
+            var existingCredentials = fido2Keys.Select(k => new PublicKeyCredentialDescriptor(CoreHelpers.Base64UrlDecode(k.CredentialId)));
+
+            // Configurate FIDO2, with the origin of the request.
+            var fido2Lib = new Fido2(new Fido2Configuration()
+            {
+                ServerDomain = _globalSettings.BaseServiceUri.Domain,
+                ServerName = _globalSettings.SiteName,
+                Origin = origin,
+                TimestampDriftTolerance = MaxFido2Time
+            });
+
+            // Create the reponse to the user
+            var response = fido2Lib.RequestNewCredential(
+                userFido2,
+                existingCredentials.ToList(),
+                authenticatorSelected,
+                AttestationConveyancePreference.None
+            );
+            //Regist the challenge and the response for later to be checked.
+            await _fido2ChallengeRepository.CreateFido2Challenge(user.Id, origin, response.ToJson(), Fido2ActionType.Registration, DateTime.UtcNow.AddMilliseconds(response.Timeout));
+
+            // Send to the user.
+            return response;
+        }
+
+        /// <summary>
+        /// Receive the data signed by is FIDO2 Key and the data containing the FIDO2 Key
+        /// </summary>
+        public async Task<bool> CompleteFido2RegistrationAsync(User user, string name, AuthenticatorAttestationRawResponse authenticatorAttestationRaw)
+        {
+            // Get the last challenge created for this user, and check if exist and if the action is correct.
+            var challenge = await _fido2ChallengeRepository.GetLastCreatedByUserIdAsync(user.Id);
+            if (challenge == null || challenge.Action != Fido2ActionType.Registration)
+            {
+                return false;
+            }
+
+            // Delete from the db, because we already have in variable and if it fails the user
+            // can't use the challenge two times.
+            await _fido2ChallengeRepository.DeleteFido2ChallengeByIdAsync(challenge.Id);
+
+            // Get the Options selected in the challenge 
+            var options = CredentialCreateOptions.FromJson(challenge.Options);
+
+            // Get all FIDO2 Keys that belongs to the user.
+            var keys = await _fido2KeyRepository.GetManyByUserIdAsync(user.Id);
+            // Checks if user has already reached the limit.
+            if (keys.Count >= MaxFido2Keys)
+            {
+                // Can only register up to MaxFido2Keys
+                return false;
+            }
+
+            // Check if already exists the key, by checking if the id matches.
+            IsCredentialIdUniqueToUserAsyncDelegate callback = async (IsCredentialIdUniqueToUserParams args) =>
+            {
+                // Check if already exist in user account
+                if (keys.Any(key => key.CredentialId.Equals(args.CredentialId)))
+                {
+                    return false;
+                }
+                return true;
+            };
+
+            // Configurate FIDO2, with the origin of the request.
+            var fido2Lib = new Fido2(new Fido2Configuration()
+            {
+                ServerDomain = _globalSettings.BaseServiceUri.Domain,
+                ServerName = _globalSettings.SiteName,
+                Origin = challenge.Origin,
+                TimestampDriftTolerance = MaxFido2Time
+            });
+
+            // Process all the information given by the FIDO2 Client.
+            var resp = await fido2Lib.MakeNewCredentialAsync(authenticatorAttestationRaw, options, callback);
+            // Check if it was unsuccessful.
+            if (resp == null || resp.Result == null)
+            {
+                return false;
+            }
+
+            // Get the credential and prepare for putting on the database.
+            AttestationVerificationSuccess credential = resp.Result;
+            var credentialId = CoreHelpers.Base64UrlEncode(credential.CredentialId);
+            var publicKey = CoreHelpers.Base64UrlEncode(credential.PublicKey);
+            var signatureCounter = credential.Counter;
+            var authenticatorTypeSelected = options.AuthenticatorSelection.AuthenticatorAttachment;
+            var transports = Fido2Key.getTransportsStringByAuthenticatorType(authenticatorTypeSelected);
+
+            // Putting in the database in the user id
+            await _fido2KeyRepository.CreateFido2Key(user.Id, name, credentialId, publicKey, signatureCounter, PublicKeyCredentialType.PublicKey, (AuthenticatorAttachment)authenticatorTypeSelected, transports);
+
+            // Check the user two-factor, if doesn't exist create.
+            var providers = user.GetTwoFactorProviders();
+            if (providers == null)
+            {
+                providers = new Dictionary<TwoFactorProviderType, TwoFactorProvider>();
+            }
+
+            // Check for FIDO2 two-factor, if doesn't exist create.
+            var provider = user.GetTwoFactorProvider(TwoFactorProviderType.Fido2);
+            if (provider == null)
+            {
+                provider = new TwoFactorProvider();
+            }
+
+            // Enable two-factor for the user.
+            provider.Enabled = true;
+
+            // Remove the old FIDO2 two-factor
+            if (providers.ContainsKey(TwoFactorProviderType.Fido2))
+            {
+                providers.Remove(TwoFactorProviderType.Fido2);
+            }
+
+            // Add The FIDO2 two-factor to the list of two-fators
+            providers.Add(TwoFactorProviderType.Fido2, provider);
+            user.SetTwoFactorProviders(providers);
+
+            // Update the user two-factor
+            await UpdateTwoFactorProviderAsync(user, TwoFactorProviderType.Fido2);
+
+            return true;
+        }
+
+        /// <summary>
+        /// Request the data necessarie to start the process of FIDO2 Key Authentication.
+        /// </summary>
+        public async Task<AssertionOptions> StartFido2AuthenticationAsync(User user, string origin)
+        {
+            //First delete the first 100 challenges that run out of time.
+            await _fido2ChallengeRepository.DeleteManyExpiredAsync();
+
+            // Get the list of two-factor
+            var providers = user.GetTwoFactorProviders();
+            if (providers == null)
+            {
+                throw new BadRequestException("No two-factor is enable.");
+            }
+
+            // Get the two-factor FIDO2
+            var provider = user.GetTwoFactorProvider(TwoFactorProviderType.Fido2);
+            if (provider == null || !provider.Enabled)
+            {
+                throw new BadRequestException("FIDO2 two-factor is disabe.");
+            }
+
+            // Get all FIDO2 Keys that belongs to the user.
+            var fido2Keys = await GetAllFido2KeysAsync(user);
+            var existingCredentials = new List<PublicKeyCredentialDescriptor>();
+            foreach (var fido2Key in fido2Keys)
+            {
+                var key = new PublicKeyCredentialDescriptor();
+                key.Id = CoreHelpers.Base64UrlDecode(fido2Key.CredentialId);
+                key.Type = fido2Key.CredentialType;
+                key.Transports = fido2Key.getTransportsEnum().ToArray();
+                existingCredentials.Add(key);
+            }
+
+            // Configurate FIDO2, with the origin of the request.
+            var fido2Lib = new Fido2(new Fido2Configuration()
+            {
+                ServerDomain = _globalSettings.BaseServiceUri.Domain,
+                ServerName = _globalSettings.SiteName,
+                Origin = origin,
+                TimestampDriftTolerance = MaxFido2Time
+            });
+
+            // Create the reponse to the user
+            var response = fido2Lib.GetAssertionOptions(
+                existingCredentials.ToList(),
+                UserVerificationRequirement.Discouraged
+            );
+            //Regist the challenge and the response for later to be checked.
+            await _fido2ChallengeRepository.CreateFido2Challenge(user.Id, origin, response.ToJson(), Fido2ActionType.Authentication, DateTime.UtcNow.AddMilliseconds(response.Timeout));
+
+            // Send to the user.
+            return response;
+        }
+
+        /// <summary>
+        /// Receive the data signed by is FIDO2 Key
+        /// </summary>
+        public async Task<bool> CompleteFido2AuthenticationAsync(User user, AuthenticatorAssertionRawResponse authenticatorAssertionRawResponse)
+        {
+            // Get the last challenge created for this user, and check if exist and if the action is correct.
+            var challenge = await _fido2ChallengeRepository.GetLastCreatedByUserIdAsync(user.Id);
+            if (challenge == null || challenge.Action != Fido2ActionType.Authentication)
+            {
+                return false;
+            }
+
+            // Delete from the db, because we already have in variable and if it fails the user
+            // can't use the challenge two times.
+            await _fido2ChallengeRepository.DeleteFido2ChallengeByIdAsync(challenge.Id);
+
+            // Get all FIDO2 Keys that belongs to the user.
+            var fido2Keys = await _fido2KeyRepository.GetManyByUserIdAsync(user.Id) as List<Fido2Key>;
+            if(fido2Keys == null && fido2Keys.Count <= 0)
+            {
+                return false;
+            }
+
+            // Check if the key used to signed is registed to the user
+            var CredentialIdChosen = CoreHelpers.Base64UrlEncode(authenticatorAssertionRawResponse.Id);
+            Fido2Key chosenKey = fido2Keys.Find(key => key.CredentialId.Equals(CredentialIdChosen));
+            if (chosenKey == null)
+            {
+                return false;
+            }
+
+            //Check if key belongs to the user and if is not compromised
+            IsUserHandleOwnerOfCredentialIdAsync callback = async (args) =>
+            {
+                return chosenKey.UserId.Equals(user.Id) && !chosenKey.Compromised;
+            };
+
+            // Get the public key that matches the credential id 
+            var publicKey = CoreHelpers.Base64UrlDecode(chosenKey.PublicKey);
+
+            // Get the Options selected in the challenge 
+            var options = AssertionOptions.FromJson(challenge.Options);
+
+            // Configurate FIDO2, with the origin of the request.
+            var fido2Lib = new Fido2(new Fido2Configuration()
+            {
+                ServerDomain = _globalSettings.BaseServiceUri.Domain,
+                ServerName = _globalSettings.SiteName,
+                Origin = challenge.Origin,
+                TimestampDriftTolerance = MaxFido2Time
+            });
+
+            // Check If UserHandle exist if doesn't exist or is empty then add the parameter has NULL, this will resolve problems when processing the data.
+            authenticatorAssertionRawResponse.Response.UserHandle = (authenticatorAssertionRawResponse.Response.UserHandle != null && authenticatorAssertionRawResponse.Response.UserHandle.Length > 0) ? authenticatorAssertionRawResponse.Response.UserHandle : null;
+            var authData = new AuthenticatorData(authenticatorAssertionRawResponse.Response.AuthenticatorData);
+
+            // Process all the information given by the FIDO2 Client.
+            var resp = await fido2Lib.MakeAssertionAsync(authenticatorAssertionRawResponse, options, publicKey, (uint)chosenKey.SignatureCounter, callback);
+
+            // Check if it was unsuccessful.
+            if (resp == null)
+            {
+                return false;
+            }
+
+            // Update the signature counter of the key chosen.
+            await _fido2KeyRepository.UpdateSignatureCounterOfFido2Key(chosenKey.Id, resp.Counter);
+
+            return true;
+        }
+
+        public async Task<bool> DeleteAllFido2KeyAsync(User user)
+        {
+            // Get the list of two-factor
+            var providers = user.GetTwoFactorProviders();
+            if (providers == null)
+            {
+                return false;
+            }
+
+            // Get the two-factor FIDO2
+            var provider = user.GetTwoFactorProvider(TwoFactorProviderType.Fido2);
+            if (provider == null || !provider.Enabled)
+            {
+                return false;
+            }
+
+            // Delete all keys that belongs to the user
+            await _fido2KeyRepository.DeleteManyByUserIdAsync(user.Id);
+
+            // Remove from the list the FIDO2 two-factor
+            providers.Remove(TwoFactorProviderType.Fido2);
+
+            // Update the user two-factor.
+            user.SetTwoFactorProviders(providers);
+            await UpdateTwoFactorProviderAsync(user, TwoFactorProviderType.Fido2);
+            return true;
+        }
+
+        public async Task<bool> DeleteFido2KeyAsync(User user, Guid id)
+        {
+            // Get the two-factor FIDO2
+            var provider = user.GetTwoFactorProvider(TwoFactorProviderType.Fido2);
+            if (provider == null || !provider.Enabled)
+            {
+                return false;
+            }
+
+            // Check if FIDO2 Key selected it belongs to the user.
+            var fido2Key = await _fido2KeyRepository.GetOneByIdAsync(id);
+            if(fido2Key == null || !fido2Key.UserId.Equals(user.Id))
+            {
+                return false;
+            }
+
+            // Delete FIDO2 Key.
+            await _fido2KeyRepository.DeleteFido2KeyByIdAsync(id);
+
+            // Check if the user deleted the last key that belong to him, if
+            // so remove the FIDO2 two-factor from the user.
+            var keys = await _fido2KeyRepository.GetManyByUserIdAsync(user.Id);
+            if(keys.Count <=0)
+            {
+                // Get the list of two-factor
+                var providers = user.GetTwoFactorProviders();
+                if (providers == null)
+                {
+                    return false;
+                }
+
+                // Remove from the list the FIDO2 two-factor
+                providers.Remove(TwoFactorProviderType.Fido2);
+
+                // Update the user two-factor.
+                user.SetTwoFactorProviders(providers);
+                await UpdateTwoFactorProviderAsync(user, TwoFactorProviderType.Fido2);
+            }
+            return true;
+        }
+
         public async Task SendEmailVerificationAsync(User user)
         {
             if (user.EmailVerified)
@@ -716,6 +1074,11 @@ namespace Bit.Core.Services
             if (!providers?.ContainsKey(type) ?? true)
             {
                 return;
+            }
+
+            if(type == TwoFactorProviderType.Fido2)
+            {
+                await _fido2KeyRepository.DeleteManyByUserIdAsync(user.Id);
             }
 
             providers.Remove(type);

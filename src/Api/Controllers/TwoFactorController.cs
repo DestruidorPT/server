@@ -14,6 +14,8 @@ using Bit.Core.Context;
 using Bit.Core.Repositories;
 using Bit.Core.Utilities;
 using Bit.Core.Utilities.Duo;
+using System.Collections.Generic;
+using Fido2NetLib;
 
 namespace Bit.Api.Controllers
 {
@@ -260,6 +262,63 @@ namespace Bit.Api.Controllers
             var response = new TwoFactorU2fResponseModel(user);
             return response;
         }
+
+
+        [HttpPost("get-fido2")]
+        public async Task<TwoFactorFido2ResponseModel> GetFido2([FromBody] TwoFactorRequestModel model)
+        {
+            var user = await CheckAsync(model.MasterPasswordHash, true);
+            var fido2Keys = await _userService.GetAllFido2KeysAsync(user);
+            var response = new TwoFactorFido2ResponseModel(user, fido2Keys);
+            return response;
+        }
+
+        [HttpPost("get-fido2-regist-challenge")]
+        public async Task<CredentialCreateOptions> GetFido2RegistrationChallenge([FromBody] TwoFactorFido2NewCredentialRequestModel model, [FromHeader(Name = "Origin")] string origin)
+        {
+            var user = await CheckAsync(model.MasterPasswordHash, true); // Get user
+            var reg = await _userService.StartFido2RegistrationAsync(user, origin, model.AuthenticatorSelected); // Get challenge to registe a new FIDO2 Key
+            return reg;
+        }
+
+        [HttpPost("fido2-regist")]
+        public async Task<TwoFactorFido2ResponseModel> PostFido2Registration([FromBody] TwoFactorFido2RegistrationRequestModel model)
+        {
+            var user = await CheckAsync(model.MasterPasswordHash, true); // Get user
+            var success = await _userService.CompleteFido2RegistrationAsync(user, model.Name, model.AuthenticatorAttestationRaw); // Complete the registration by checking the signature and saving the public key
+            var fido2Keys = await _userService.GetAllFido2KeysAsync(user); // Get all FIDO2 Keys of this user
+            if (!success)
+            {
+                throw new BadRequestException("Unable to complete Fido2 key registration.");
+            }
+            var response = new TwoFactorFido2ResponseModel(user, fido2Keys); // Send the keys registed in the response
+            return response;
+        }
+
+        [AllowAnonymous]
+        [HttpPost("get-fido2-auth-challenge")]
+        public async Task<AssertionOptions> GetFido2AuthenticationChallenge([FromBody] TwoFactorAnonymousRequestModel model, [FromHeader(Name = "Origin")] string origin)
+        {
+            var user = await _userManager.FindByEmailAsync(model.Email.ToLowerInvariant()); // Get user as anonymous, using email
+            if (user != null && await _userService.CheckPasswordAsync(user, model.MasterPasswordHash)) // Check if password is correct and check if user exist
+            {
+                return await _userService.StartFido2AuthenticationAsync(user, origin); // Start FIDO2 authentication by requesting the challenge for authentication
+            }
+
+            await Task.Delay(2000);
+            throw new BadRequestException("Cannot use FIDO2 two-factor.");
+        }
+
+        [HttpDelete("fido2")]
+        public async Task<TwoFactorFido2ResponseModel> DeleteFido2([FromBody] TwoFactorFido2DeleteRequestModel model)
+        {
+            var user = await CheckAsync(model.MasterPasswordHash, true);
+            await _userService.DeleteFido2KeyAsync(user, model.Id);
+            var fido2Keys = await _userService.GetAllFido2KeysAsync(user);
+            var response = new TwoFactorFido2ResponseModel(user, fido2Keys);
+            return response;
+        }
+
 
         [HttpPost("get-email")]
         public async Task<TwoFactorEmailResponseModel> GetEmail([FromBody]TwoFactorRequestModel model)

@@ -75,6 +75,7 @@ namespace Bit.Core.Utilities
                 services.AddSingleton<ICollectionCipherRepository, SqlServerRepos.CollectionCipherRepository>();
                 services.AddSingleton<IGroupRepository, SqlServerRepos.GroupRepository>();
                 services.AddSingleton<IU2fRepository, SqlServerRepos.U2fRepository>();
+                services.AddSingleton<IFido2KeyRepository, SqlServerRepos.Fido2KeyRepository>();
                 services.AddSingleton<IInstallationRepository, SqlServerRepos.InstallationRepository>();
                 services.AddSingleton<IMaintenanceRepository, SqlServerRepos.MaintenanceRepository>();
                 services.AddSingleton<ITransactionRepository, SqlServerRepos.TransactionRepository>();
@@ -291,6 +292,8 @@ namespace Bit.Core.Utilities
                     CoreHelpers.CustomProviderName(TwoFactorProviderType.Duo))
                 .AddTokenProvider<U2fTokenProvider>(
                     CoreHelpers.CustomProviderName(TwoFactorProviderType.U2f))
+                .AddTokenProvider<Fido2TokenProvider>(
+                    CoreHelpers.CustomProviderName(TwoFactorProviderType.Fido2))
                 .AddTokenProvider<TwoFactorRememberTokenProvider>(
                     CoreHelpers.CustomProviderName(TwoFactorProviderType.Remember))
                 .AddTokenProvider<EmailTokenProvider<User>>(TokenOptions.DefaultEmailProvider);

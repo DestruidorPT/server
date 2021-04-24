@@ -1,8 +1,9 @@
 ﻿using Bit.Core.Enums;
 using Bit.Core.Models.Table;
+using Fido2NetLib;
+using System;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
-using System.Linq;
 
 namespace Bit.Core.Models.Api
 {
@@ -244,6 +245,35 @@ namespace Bit.Core.Models.Api
         }
     }
 
+    /// <summary>
+    /// Class of data received that is necessary to start the regist of new FIDO2 Key.
+    /// </summary>
+    public class TwoFactorFido2NewCredentialRequestModel : TwoFactorRequestModel
+    {
+        [Required]
+        public AuthenticatorSelection AuthenticatorSelected { get; set; }
+    }
+
+    /// <summary>
+    /// Class of data received that is necessary to finalize the regist of new FIDO2 Key.
+    /// </summary>
+    public class TwoFactorFido2RegistrationRequestModel : TwoFactorRequestModel
+    {
+        [Required]
+        public string Name { get; set; }
+        [Required]
+        public AuthenticatorAttestationRawResponse AuthenticatorAttestationRaw { get; set; }
+    }
+
+    /// <summary>
+    /// Class of data received that is necessary to delete one FIDO2 Key from the user.
+    /// </summary>
+    public class TwoFactorFido2DeleteRequestModel : TwoFactorRequestModel
+    {
+        [Required]
+        public Guid Id { get; set; }
+    }
+
     public class UpdateTwoFactorEmailRequestModel : TwoFactorEmailRequestModel
     {
         [Required]
@@ -259,6 +289,22 @@ namespace Bit.Core.Models.Api
 
     public class TwoFactorRequestModel
     {
+        [Required]
+        public string MasterPasswordHash { get; set; }
+    }
+
+    /// <summary>
+    /// Class of data received that is necessary to execute the function that tried to use.
+    /// This is used in case of android and web, when the FIDO2 challenge runs out of time or 
+    /// fails to authenticate, so to request a new challenge the client has to send a request 
+    /// to the api and send the username and password for the client to be able to receive a new challenge.
+    /// </summary>
+    public class TwoFactorAnonymousRequestModel
+    {
+        [Required]
+        [EmailAddress]
+        [StringLength(50)]
+        public string Email { get; set; }
         [Required]
         public string MasterPasswordHash { get; set; }
     }
